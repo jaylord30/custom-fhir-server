@@ -7,12 +7,18 @@ import ca.uhn.fhir.rest.api.RestOperationTypeEnum;
 import ca.uhn.fhir.rest.server.exceptions.UnprocessableEntityException;
 import ca.uhn.fhir.rest.server.servlet.ServletRequestDetails;
 import org.hl7.fhir.instance.model.api.IBaseResource;
-import org.hl7.fhir.r4.model.*;
+import org.hl7.fhir.r4.model.Encounter;
+import org.hl7.fhir.r4.model.Enumerations;
+import org.hl7.fhir.r4.model.Identifier;
+import org.hl7.fhir.r4.model.Patient;
+import org.hl7.fhir.r4.model.Reference;
+import org.hl7.fhir.r4.model.Resource;
+import org.hl7.fhir.r4.model.ServiceRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.util.List;
+import java.util.Set;
 
 @Interceptor
 @Component
@@ -20,15 +26,48 @@ public class PHResourceValidationInterceptor {
 
     private static final Logger ourLog = LoggerFactory.getLogger(PHResourceValidationInterceptor.class);
 
-    // Profile URLs
-    private static final String PH_CORE_PATIENT_PROFILE = "https://hl7.org.ph/fhir/StructureDefinition/PHCore-Patient";
-    private static final String EREFERRAL_SERVICEREQUEST_PROFILE = "https://hl7.org.ph/fhir/StructureDefinition/eReferral-ServiceRequest";
-    private static final String EREFERRAL_ENCOUNTER_PROFILE = "https://hl7.org.ph/fhir/StructureDefinition/eReferral-Encounter";
+    // Profile URLs - current PH Core + PH eReferral CI build canonicals
+    private static final String PH_CORE_PATIENT_PROFILE =
+            "https://fhir.doh.gov.ph/phcore/StructureDefinition/ph-core-patient";
 
-    // Identifier system URLs
-    private static final String PHILHEALTH_SYSTEM = "https://nhia.philhealth.gov.ph/phr/identifier/philhealth-id";
-    private static final String PHILSYS_SYSTEM = "https://www.philsys.gov.ph/phr/identifier/philsys-id";
-    private static final String MRN_SYSTEM = "http://hospital.smarthealthit.org/identifier/mrn";
+    private static final String EREFERRAL_SERVICEREQUEST_PROFILE =
+            "https://fhir.doh.gov.ph/pheref/StructureDefinition/ereferral-service-request";
+
+    private static final String EREFERRAL_ENCOUNTER_PROFILE =
+            "https://fhir.doh.gov.ph/pheref/StructureDefinition/ereferral-encounter";
+
+    // PH Core Patient identifier system URLs
+    private static final String PHILHEALTH_SYSTEM =
+            "http://philhealth.gov.ph/fhir/Identifier/philhealth-id";
+
+    private static final String PHILSYS_SYSTEM =
+            "http://philsys.gov.ph/fhir/Identifier/philsys-id";
+
+    // Local/business MRN system. Not a PH Core fixed Patient identifier slice,
+    // but you can allow it if your EMR/FHIR server needs MRN.
+    private static final String MRN_SYSTEM =
+            "http://hospital.smarthealthit.org/identifier/mrn";
+
+    // eReferral Philippine-specific identifier systems.
+    // Use these later if you validate Practitioner / Organization / facility identifiers.
+    private static final String EREF_PHILHEALTH_OID =
+            "urn:oid:2.16.840.1.113883.2.9.4.3.2";
+
+    private static final String EREF_PRC_OID =
+            "urn:oid:2.16.840.1.113883.2.9.4.3.3";
+
+    private static final String EREF_NHFR_OID =
+            "urn:oid:2.16.840.1.113883.2.9.4.1.1";
+
+    private static final Set<String> ALLOWED_PATIENT_IDENTIFIER_SYSTEMS = Set.of(
+            PHILHEALTH_SYSTEM,
+            PHILSYS_SYSTEM,
+            MRN_SYSTEM,
+
+            // Optional compatibility with eReferral examples / older payloads.
+            // Remove this if you want strict PH Core only.
+            EREF_PHILHEALTH_OID
+    );
 
     @Hook(Pointcut.STORAGE_PRECOMMIT_RESOURCE_CREATED)
     public void resourceCreated(IBaseResource theResource, ServletRequestDetails theRequestDetails) {
@@ -52,62 +91,81 @@ public class PHResourceValidationInterceptor {
             case "Patient":
                 validatePatient((Patient) theResource);
                 break;
+
             case "ServiceRequest":
                 validateServiceRequest((ServiceRequest) theResource);
                 break;
+
             case "Encounter":
                 validateEncounter((Encounter) theResource);
                 break;
+
             case "Organization":
             case "Practitioner":
             case "PractitionerRole":
-                // Do not force PH Core - let official validator handle if profile is declared
-                ourLog.info("{} resource: allowing PH Core validation to be handled by official validator", resourceType);
+                ourLog.info("{} resource: allowing official validator to handle profile validation", resourceType);
                 break;
+
             default:
-                // For unknown resource types, do not block - let HAPI normal validation handle them
-                ourLog.info("Unknown resource type {}: letting HAPI normal validation handle it", resourceType);
+                ourLog.info("Resource type {}: letting HAPI normal validation handle it", resourceType);
                 break;
         }
     }
 
     private void validatePatient(Patient patient) {
-        // Require PHCore-Patient profile
         boolean hasPHCoreProfile = patient.getMeta().getProfile().stream()
-                .anyMatch(profile -> profile.getValue().equals(PH_CORE_PATIENT_PROFILE));
-        
+                .anyMatch(profile -> PH_CORE_PATIENT_PROFILE.equals(profile.getValue()));
+
         if (!hasPHCoreProfile) {
-            throw new UnprocessableEntityException("Patient resource must declare the PHCore-Patient profile: " + PH_CORE_PATIENT_PROFILE);
+            throw new UnprocessableEntityException(
+                    "Patient resource must declare the PH Core Patient profile: " + PH_CORE_PATIENT_PROFILE
+            );
         }
 
-        // Require identifier
         if (patient.getIdentifier().isEmpty()) {
             throw new UnprocessableEntityException("Patient resource must have at least one identifier");
         }
 
-        // Allow only PhilHealth, PhilSys, or MRN identifier systems
+        boolean hasUsableIdentifier = false;
+
         for (Identifier identifier : patient.getIdentifier()) {
             String system = identifier.getSystem();
-            if (system != null && 
-                !system.equals(PHILHEALTH_SYSTEM) && 
-                !system.equals(PHILSYS_SYSTEM) && 
-                !system.equals(MRN_SYSTEM)) {
-                throw new UnprocessableEntityException("Patient identifier system must be one of: PhilHealth (" + 
-                    PHILHEALTH_SYSTEM + "), PhilSys (" + PHILSYS_SYSTEM + "), or MRN (" + MRN_SYSTEM + "). Found: " + system);
+            String value = identifier.getValue();
+
+            if (system == null || system.isBlank()) {
+                throw new UnprocessableEntityException("Patient identifier.system is required");
             }
+
+            if (value == null || value.isBlank()) {
+                throw new UnprocessableEntityException("Patient identifier.value is required");
+            }
+
+            if (!ALLOWED_PATIENT_IDENTIFIER_SYSTEMS.contains(system)) {
+                throw new UnprocessableEntityException(
+                        "Patient identifier system must be one of: " +
+                                "PhilHealth (" + PHILHEALTH_SYSTEM + "), " +
+                                "PhilSys (" + PHILSYS_SYSTEM + "), " +
+                                "MRN (" + MRN_SYSTEM + "), " +
+                                "or eReferral PhilHealth OID (" + EREF_PHILHEALTH_OID + "). " +
+                                "Found: " + system
+                );
+            }
+
+            hasUsableIdentifier = true;
         }
 
-        // Require name
+        if (!hasUsableIdentifier) {
+            throw new UnprocessableEntityException("Patient resource must have at least one usable identifier");
+        }
+
         if (patient.getName().isEmpty()) {
             throw new UnprocessableEntityException("Patient resource must have at least one name");
         }
 
-        // Require gender
         if (patient.getGender() == null || patient.getGender() == Enumerations.AdministrativeGender.UNKNOWN) {
-            throw new UnprocessableEntityException("Patient resource must have a gender");
+            throw new UnprocessableEntityException("Patient resource must have a known gender");
         }
 
-        // Require birthDate
         if (patient.getBirthDate() == null || patient.getBirthDateElement().isEmpty()) {
             throw new UnprocessableEntityException("Patient resource must have a birthDate");
         }
@@ -116,81 +174,92 @@ public class PHResourceValidationInterceptor {
     }
 
     private void validateServiceRequest(ServiceRequest serviceRequest) {
-        // Require eReferral ServiceRequest profile
         boolean hasEReferralProfile = serviceRequest.getMeta().getProfile().stream()
-                .anyMatch(profile -> profile.getValue().equals(EREFERRAL_SERVICEREQUEST_PROFILE));
-        
+                .anyMatch(profile -> EREFERRAL_SERVICEREQUEST_PROFILE.equals(profile.getValue()));
+
         if (!hasEReferralProfile) {
-            throw new UnprocessableEntityException("ServiceRequest resource must declare the eReferral ServiceRequest profile: " + EREFERRAL_SERVICEREQUEST_PROFILE);
+            throw new UnprocessableEntityException(
+                    "ServiceRequest resource must declare the eReferral ServiceRequest profile: " +
+                            EREFERRAL_SERVICEREQUEST_PROFILE
+            );
         }
 
-        // Require status
         if (serviceRequest.getStatus() == null) {
             throw new UnprocessableEntityException("ServiceRequest resource must have a status");
         }
 
-        // Require intent
         if (serviceRequest.getIntent() == null) {
             throw new UnprocessableEntityException("ServiceRequest resource must have an intent");
         }
 
-        // Require subject = Patient/...
+        if (serviceRequest.getIntent() != ServiceRequest.ServiceRequestIntent.ORDER) {
+            throw new UnprocessableEntityException("ServiceRequest intent must be 'order'");
+        }
+
         if (serviceRequest.getSubject() == null || serviceRequest.getSubject().isEmpty()) {
             throw new UnprocessableEntityException("ServiceRequest resource must have a subject");
         }
-        
+
         String subjectReference = serviceRequest.getSubject().getReference();
-        if (subjectReference == null || !subjectReference.startsWith("Patient/")) {
-            throw new UnprocessableEntityException("ServiceRequest subject must be a Patient reference (e.g., Patient/...). Found: " + subjectReference);
+        if (!isPatientReference(subjectReference)) {
+            throw new UnprocessableEntityException(
+                    "ServiceRequest subject must be a Patient reference. Found: " + subjectReference
+            );
         }
 
-        // Require requester
         if (serviceRequest.getRequester() == null || serviceRequest.getRequester().isEmpty()) {
             throw new UnprocessableEntityException("ServiceRequest resource must have a requester");
         }
 
-        // Require performer or supporting info depending on workflow
-        if (serviceRequest.getPerformer().isEmpty() && (serviceRequest.getSupportingInfo() == null || serviceRequest.getSupportingInfo().isEmpty())) {
-            throw new UnprocessableEntityException("ServiceRequest resource must have either performer or supportingInfo");
+        Reference requester = serviceRequest.getRequester();
+        String requesterReference = requester.getReference();
+        if (requesterReference == null || requesterReference.isBlank()) {
+            throw new UnprocessableEntityException("ServiceRequest requester.reference is required");
+        }
+
+        if (serviceRequest.getPerformer().isEmpty() && serviceRequest.getSupportingInfo().isEmpty()) {
+            throw new UnprocessableEntityException(
+                    "ServiceRequest resource must have either performer or supportingInfo"
+            );
         }
 
         ourLog.info("ServiceRequest resource validation passed");
     }
 
     private void validateEncounter(Encounter encounter) {
-        // Only enforce eReferral rules if the Encounter declares an eReferral profile
         boolean hasEReferralProfile = encounter.getMeta().getProfile().stream()
-                .anyMatch(profile -> profile.getValue().equals(EREFERRAL_ENCOUNTER_PROFILE));
+                .anyMatch(profile -> EREFERRAL_ENCOUNTER_PROFILE.equals(profile.getValue()));
 
         if (!hasEReferralProfile) {
             ourLog.info("Encounter does not declare eReferral profile - skipping eReferral validation");
             return;
         }
 
-        // Require subject = Patient/...
         if (encounter.getSubject() == null || encounter.getSubject().isEmpty()) {
             throw new UnprocessableEntityException("Encounter resource must have a subject");
         }
-        
+
         String subjectReference = encounter.getSubject().getReference();
-        if (subjectReference == null || !subjectReference.startsWith("Patient/")) {
-            throw new UnprocessableEntityException("Encounter subject must be a Patient reference (e.g., Patient/...). Found: " + subjectReference);
+        if (!isPatientReference(subjectReference)) {
+            throw new UnprocessableEntityException(
+                    "Encounter subject must be a Patient reference. Found: " + subjectReference
+            );
         }
 
-        // Require status
         if (encounter.getStatus() == null) {
             throw new UnprocessableEntityException("Encounter resource must have a status");
         }
 
-        // Require class/type if your IG requires it
-        if (encounter.getClass_() == null) {
+        if (encounter.getClass_() == null || encounter.getClass_().isEmpty()) {
             throw new UnprocessableEntityException("Encounter resource must have a class");
         }
 
-        if (encounter.getType() == null || encounter.getType().isEmpty()) {
-            throw new UnprocessableEntityException("Encounter resource must have at least one type");
-        }
-
         ourLog.info("Encounter resource validation passed");
+    }
+
+    private boolean isPatientReference(String reference) {
+        return reference != null &&
+                !reference.isBlank() &&
+                (reference.startsWith("Patient/") || reference.contains("/Patient/"));
     }
 }
